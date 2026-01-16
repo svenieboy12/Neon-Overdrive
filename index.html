@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Neon Overdrive: Action Rhythm</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: 'Courier New', monospace; }
+        #ui-container { position: absolute; width: 100%; top: 20px; display: none; justify-content: space-between; padding: 0 40px; box-sizing: border-box; pointer-events: none; z-index: 100; }
+        #score { color: #00ffff; font-size: 32px; font-weight: bold; text-shadow: 0 0 10px #00ffff; }
+        #lives { color: #ff00ff; font-size: 32px; text-shadow: 0 0 10px #ff00ff; }
+        .overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.85); display: flex; flex-direction: column; justify-content: center; align-items: center; z-index: 200; color: white; text-align: center; }
+        h1 { font-size: 50px; color: #00ff00; text-shadow: 0 0 20px #00ff00; }
+        .btn { padding: 15px 40px; font-size: 20px; background: transparent; border: 2px solid #00ffff; color: #00ffff; cursor: pointer; text-transform: uppercase; letter-spacing: 3px; margin: 10px; transition: 0.3s; }
+        .btn:hover { background: #00ffff; color: #000; box-shadow: 0 0 20px #00ffff; }
+        .btn-download { border-color: #ff00ff !important; color: #ff00ff !important; }
+        .btn-download:hover { background: #ff00ff !important; color: #000 !important; }
+        #boss-alert { position: absolute; top: 40%; width: 100%; text-align: center; color: #ff0000; font-size: 40px; font-weight: bold; display: none; z-index: 150; animation: flash 0.5s infinite; }
+        @keyframes flash { 0% { opacity: 1; } 50% { opacity: 0.3; } }
+        #level-alert { position: absolute; top: 25%; width: 100%; text-align: center; color: #ffff00; font-size: 50px; font-weight: bold; display: none; z-index: 160; text-shadow: 0 0 20px #ffff00; }
+        #flash-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: rgba(255, 0, 0, 0); pointer-events: none; z-index: 1000; }
+        .hit-anim { animation: flashRed 0.4s ease-out; }
+        @keyframes flashRed { 0% { background: rgba(255, 0, 0, 0.6); } 100% { background: rgba(255, 0, 0, 0); } }
+    </style>
+</head>
+<body>
+    <div id="flash-overlay"></div>
+    <div id="ui-container">
+        <div id="score">SCORE: 0000</div>
+        <div id="lives">❤️❤️❤️</div>
+    </div>
+    <div id="boss-alert">WARNING: UFO INBOUND</div>
+    <div id="level-alert">SPEED UP!</div>
+    
+    <div id="start-screen" class="overlay">
+        <h1>NEON OVERDRIVE</h1>
+        <p style="color: #00ffff;">SYNC YOUR EARS TO THE BEAT</p>
+        <button class="btn" onclick="startGame()">Start Action</button>
+    </div>
+
+    <div id="death-screen" class="overlay" style="display: none;">
+        <h1 style="color: #ff0000;">CRASHED</h1>
+        <div id="final-score" style="font-size:24px; margin:10px;"></div>
+        <div id="high-score" style="font-size:24px; margin:10px;"></div>
+        <button class="btn" onclick="startGame()">Restart</button>
+        <button class="btn btn-download" onclick="downloadScore()">Download Report</button>
+    </div>
+
+    <script type="importmap">{ "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js" } }</script>
+    <script type="module">
+        import * as THREE from 'three';
+
+        // --- AUDIO ENGINE ---
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        let musicStep = 0, musicTimer = null;
+
+        function synth(freq, type, duration, vol, glide = 0) {
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.type = type;
+            osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+            if(glide > 0) osc.frequency.exponentialRampToValueAtTime(glide, audioCtx.currentTime + duration);
+            gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+            gain.gain.linearRampToValueAtTime(0, audioCtx.currentTime + duration);
+            osc.connect(gain); gain.connect(audioCtx.destination);
+            osc.start(); osc.stop(audioCtx.currentTime + duration);
+        }
+
+        function playActionMusic() {
+            if (musicTimer) clearInterval(musicTimer);
+            musicTimer = setInterval(() => {
+                if (!gameActive) return;
+                if (musicStep % 4 === 0) synth(60, 'square', 0.2, 0.2, 40);
+                if (musicStep % 4 === 2) synth(200, 'sawtooth', 0.1, 0.1);
+                const scale = [261.63, 293.66, 311.13, 349.23, 392.00, 415.30].map(f => f * (1 + currentLevel*0.2));
+                synth(scale[Math.floor(Math.random() * scale.length)], 'sawtooth', 0.15, 0.05);
+                musicStep++;
+            }, 150);
+        }
+
+        // --- GAME ENGINE ---
+        const scene = new THREE.Scene();
+        scene.fog = new THREE.FogExp2(0x050015, 0.004);
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 5000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+        camera.position.set(0, 8, 22); camera.lookAt(0, 0, -10);
+
+        const worldGroup = new THREE.Group();
+        scene.add(worldGroup);
+
+        // Persistent Session High Score
+        window.sessionHighScore = 0; 
+        
+        let currentLevel = 1, nextLevelThreshold = 2000;
+        let gameActive = false, score = 0, lives = 3, speed = 1.7, vY = 0, jumpCount = 0, invuln = false;
+        let bossActive = false, scoreAtBossEnd = 0, enemies = [], lasers = [];
+        const keys = {};
+
+        function addStars(count, size, color) {
+            const geo = new THREE.BufferGeometry();
+            const pos = new Float32Array(count * 3);
+            for(let i=0; i<count*3; i++) pos[i] = (Math.random()-0.5)*4000;
+            geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+            worldGroup.add(new THREE.Points(geo, new THREE.PointsMaterial({ size, color })));
+        }
+        addStars(12000, 1.1, 0xffffff);
+        addStars(5000, 1.5, 0x00ffff);
+
+        const rings = [];
+        for (let i = 0; i < 80; i++) {
+            const ring = new THREE.Mesh(new THREE.TorusGeometry(14, 0.1, 8, 60), new THREE.MeshBasicMaterial({ color: 0x00ffff }));
+            ring.position.z = -i * 6;
+            worldGroup.add(ring); rings.push(ring);
+        }
+
+        const player = new THREE.Mesh(new THREE.BoxGeometry(1.8, 1.8, 1.8), new THREE.MeshBasicMaterial({ color: 0x00ff00, wireframe: true }));
+        player.position.y = -11; 
+        scene.add(player);
+
+        const bossGroup = new THREE.Group();
+        const saucer = new THREE.Mesh(new THREE.CylinderGeometry(18, 18, 3, 32), new THREE.MeshBasicMaterial({ color: 0xaaaaaa, wireframe: true }));
+        const dome = new THREE.Mesh(new THREE.SphereGeometry(7, 16, 16, 0, Math.PI*2, 0, 1.5), new THREE.MeshBasicMaterial({ color: 0x00ff00, transparent: true, opacity: 0.4 }));
+        dome.position.y = 1; bossGroup.add(saucer, dome); bossGroup.position.z = -2500;
+        worldGroup.add(bossGroup);
+
+        window.startGame = function() {
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+            document.getElementById('start-screen').style.display = 'none';
+            document.getElementById('death-screen').style.display = 'none';
+            document.getElementById('ui-container').style.display = 'flex';
+            
+            enemies.forEach(e => worldGroup.remove(e)); lasers.forEach(l => worldGroup.remove(l));
+            enemies = []; lasers = []; 
+            worldGroup.rotation.z = 0; bossGroup.position.z = -2500;
+            score = 0; lives = 3; speed = 1.7; bossActive = false; scoreAtBossEnd = 0; 
+            currentLevel = 1; nextLevelThreshold = 2000; invuln = false; player.visible = true; player.position.y = -11; vY = 0;
+            rings.forEach(r => r.material.color.setHex(0x00ffff));
+            document.getElementById('score').innerText = "SCORE: 0000";
+            document.getElementById('lives').innerText = "❤️❤️❤️";
+            gameActive = true;
+            playActionMusic();
+        };
+
+        window.downloadScore = function() {
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            canvas.width = renderer.domElement.width; canvas.height = renderer.domElement.height;
+            ctx.drawImage(renderer.domElement, 0, 0);
+            ctx.fillStyle = "#00ff00"; ctx.font = "bold 40px Courier New";
+            ctx.fillText("SCORE: " + score, 50, 80);
+            const link = document.createElement('a');
+            link.download = 'NeonReport.png';
+            link.href = canvas.toDataURL('image/png');
+            link.click();
+        };
+
+        function triggerHit() {
+            if (invuln || !gameActive) return;
+            lives--; invuln = true;
+            synth(150, 'sawtooth', 0.5, 0.4, 40); 
+            document.getElementById('lives').innerText = "❤️".repeat(lives);
+            document.getElementById('flash-overlay').classList.add('hit-anim');
+            setTimeout(() => document.getElementById('flash-overlay').classList.remove('hit-anim'), 400);
+            
+            if (lives <= 0) {
+                gameActive = false;
+                if(score > window.sessionHighScore) window.sessionHighScore = score;
+                document.getElementById('death-screen').style.display = 'flex';
+                document.getElementById('final-score').innerText = `SCORE: ${score}`;
+                document.getElementById('high-score').innerText = `SESSION BEST: ${window.sessionHighScore}`;
+                return;
+            }
+            let flicker = setInterval(() => player.visible = !player.visible, 100);
+            setTimeout(() => { clearInterval(flicker); player.visible = true; invuln = false; }, 1500);
+        }
+
+        window.onkeydown = (e) => { 
+            keys[e.code] = true; 
+            if (e.code === 'Space' && jumpCount < 2 && gameActive) { 
+                vY = 0.45; jumpCount++; 
+                synth(400, 'sine', 0.1, 0.1, 600); 
+            } 
+        };
+        window.onkeyup = (e) => keys[e.code] = false;
+
+        function animate() {
+            requestAnimationFrame(animate);
+            if (!gameActive) { renderer.render(scene, camera); return; }
+
+            if (score >= nextLevelThreshold) {
+                currentLevel++; nextLevelThreshold += 3000; speed += 0.4;
+                synth(500, 'sine', 0.6, 0.2, 1000); 
+                const colors = [0xff00ff, 0xff8800, 0xffff00, 0x00ff00, 0x00ffff];
+                rings.forEach(r => r.material.color.setHex(colors[currentLevel % colors.length]));
+                const la = document.getElementById('level-alert');
+                la.style.display = 'block'; setTimeout(() => la.style.display = 'none', 2000);
+            }
+
+            if ((score - scoreAtBossEnd) >= 1500 && !bossActive) {
+                bossActive = true; bossGroup.position.z = -180;
+                document.getElementById('boss-alert').style.display = 'block';
+                const bossShooter = setInterval(() => {
+                    if(!bossActive || !gameActive) { clearInterval(bossShooter); return; }
+                    synth(800, 'sine', 0.1, 0.1); 
+                    const laser = new THREE.Mesh(new THREE.IcosahedronGeometry(1.5, 0), new THREE.MeshBasicMaterial({ color: 0x00ff00 }));
+                    const wPos = new THREE.Vector3(); bossGroup.getWorldPosition(wPos);
+                    laser.position.copy(wPos); laser.position.applyAxisAngle(new THREE.Vector3(0,0,1), -worldGroup.rotation.z);
+                    worldGroup.add(laser); lasers.push(laser);
+                }, 400);
+                setTimeout(() => { 
+                    bossActive = false; bossGroup.position.z = -2500; 
+                    document.getElementById('boss-alert').style.display = 'none'; scoreAtBossEnd = score; 
+                }, 10000);
+            }
+
+            if (keys['KeyA'] || keys['ArrowLeft']) worldGroup.rotation.z += 0.09;
+            if (keys['KeyD'] || keys['ArrowRight']) worldGroup.rotation.z -= 0.09;
+            player.position.y += vY;
+            if (player.position.y <= -11) { player.position.y = -11; vY = 0; jumpCount = 0; } else { vY -= 0.025; }
+
+            if(bossActive) {
+                const t = Date.now() * 0.003;
+                bossGroup.position.y = Math.sin(t) * 6; bossGroup.position.x = Math.cos(t * 0.7) * 9;
+                bossGroup.rotation.z = -worldGroup.rotation.z; saucer.rotation.y += 0.1;
+            }
+
+            [...enemies, ...lasers].forEach((obj) => {
+                obj.position.z += speed * (obj.geometry.type === 'IcosahedronGeometry' ? 2 : 1);
+                const worldPos = new THREE.Vector3(); obj.getWorldPosition(worldPos);
+                if (!invuln && player.position.distanceTo(worldPos) < 3.8) {
+                    triggerHit();
+                    if (obj.geometry.type === 'BoxGeometry') { worldGroup.remove(obj); enemies.splice(enemies.indexOf(obj), 1); }
+                }
+                if (obj.position.z > 50) {
+                    worldGroup.remove(obj);
+                    if (obj.geometry.type === 'BoxGeometry') { 
+                        enemies.splice(enemies.indexOf(obj), 1); score += 50;
+                        document.getElementById('score').innerText = `SCORE: ${score.toString().padStart(4, '0')}`; 
+                    } else { lasers.splice(lasers.indexOf(obj), 1); }
+                }
+            });
+
+            rings.forEach(r => { r.position.z += speed; if(r.position.z > 30) r.position.z = -450; });
+            renderer.render(scene, camera);
+        }
+        animate();
+        
+        setInterval(() => {
+            if (!gameActive || bossActive) return;
+            for(let i=0; i<3; i++) {
+                const enemy = new THREE.Mesh(new THREE.BoxGeometry(5, 4+Math.random()*6, 3), new THREE.MeshBasicMaterial({ color: 0x00ffff, wireframe: true }));
+                const ang = Math.random() * Math.PI * 2;
+                enemy.position.set(Math.sin(ang)*11, Math.cos(ang)*11, -300);
+                enemy.lookAt(0,0,enemy.position.z); worldGroup.add(enemy); enemies.push(enemy);
+            }
+        }, 400);
+    </script>
+</body>
+</html>
